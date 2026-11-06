@@ -31,13 +31,14 @@ pip install -r requirements.txt
 
 ### 2. Configure Credentials
 
-Create a `.env` file with your credentials:
+Create the config file in your home folder (readable only by you):
 
 ```bash
-cp .env.example .env
+mkdir -p ~/.config/mywhoosh-to-garmin
+install -m 600 .env.example ~/.config/mywhoosh-to-garmin/config.env
 ```
 
-Edit `.env` and add your credentials:
+Edit `~/.config/mywhoosh-to-garmin/config.env` and add your credentials:
 
 ```bash
 MYWHOOSH_EMAIL=your_email@example.com
@@ -47,7 +48,16 @@ GARMIN_PASSWORD=your_garmin_password
 LOG_LEVEL=INFO
 ```
 
-**Important:** Never commit your `.env` file! It's already in `.gitignore`.
+The config file is looked up in this order (first one found is used):
+
+1. `--config PATH` or `$MYWHOOSH_TO_GARMIN_CONFIG`
+2. `~/.config/mywhoosh-to-garmin/config.env` (respects `$XDG_CONFIG_HOME`)
+3. `./.env` in the current directory (legacy location)
+
+Variables already set in the environment take precedence over the file. The log shows
+which file was used and warns if it is readable by other users.
+
+**Important:** If you use `./.env`, never commit it! It's already in `.gitignore`.
 
 ### 3. Run the Sync
 

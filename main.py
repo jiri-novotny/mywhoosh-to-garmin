@@ -16,11 +16,11 @@ import logging
 import warnings
 import argparse
 from datetime import datetime
-from dotenv import load_dotenv
 
 # Suppress urllib3 LibreSSL warning on macOS
 warnings.filterwarnings('ignore', message='urllib3 v2 only supports OpenSSL 1.1.1+')
 
+from config import load_config_file, config_candidates, is_world_readable
 from services.mywhoosh_service import MyWhooshService
 from services.fit_file_service import FitFileService
 from services.garmin_service import GarminService
@@ -59,18 +59,25 @@ def setup_logging(log_level: str = 'INFO') -> None:
     root_logger.addHandler(file_handler)
 
 
-def load_config() -> dict:
-    """Load configuration from environment variables.
-    
+def load_config(config_path: str = None) -> dict:
+    """Load configuration from the config file and environment variables.
+
+    Args:
+        config_path: Explicit config file (otherwise see config.py for lookup order)
+
     Returns:
         Dictionary with configuration values
         
     Raises:
         ValueError: If required configuration is missing
     """
-    load_dotenv()
-    
+    try:
+        used_file = load_config_file(config_path)
+    except FileNotFoundError as e:
+        raise ValueError(str(e)) from e
+
     config = {
+        'config_file': used_file,
         'mywhoosh_email': os.getenv('MYWHOOSH_EMAIL'),
         'mywhoosh_password': os.getenv('MYWHOOSH_PASSWORD'),
         'garmin_username': os.getenv('GARMIN_USERNAME'),
@@ -102,7 +109,9 @@ def load_config() -> dict:
         missing_vars = [k.upper() for k in missing]
         raise ValueError(
             f"Missing required configuration: {', '.join(missing_vars)}\n"
-            f"Please check your .env file. See .env.example for reference."
+            f"Config file used: {used_file or 'none found'}. Searched:\n  "
+            + "\n  ".join(config_candidates(config_path))
+            + "\nSee .env.example for reference."
         )
     
     return config
@@ -130,6 +139,11 @@ def main() -> int:
         help='Skip duplicate checking (faster but may upload duplicates)'
     )
     parser.add_argument(
+        '--config',
+        metavar='PATH',
+        help='Config file (default: ~/.config/mywhoosh-to-garmin/config.env, then ./.env)'
+    )
+    parser.add_argument(
         '--merge',
         action='store_true',
         help='Merge MyWhoosh rides into the matching watch recordings on Garmin Connect '
@@ -148,7 +162,7 @@ def main() -> int:
     
     try:
         # Load configuration
-        config = load_config()
+        config = load_config(args.config)
         
         # Setup logging
         setup_logging(config['log_level'])
@@ -159,6 +173,10 @@ def main() -> int:
         logger.info("MyWhoosh to Garmin Connect Activity Sync")
         logger.info("=" * 80)
         logger.info(f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Config file: {config['config_file'] or 'none (environment variables only)'}")
+        if config['config_file'] and is_world_readable(config['config_file']):
+            logger.warning(f"Config file {config['config_file']} is readable by other users; "
+                           f"run: chmod 600 {config['config_file']}")
         logger.info("")
         
         # Initialize services

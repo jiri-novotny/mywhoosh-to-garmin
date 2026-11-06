@@ -116,7 +116,9 @@ python main.py --batch 10 --no-duplicates
 
 ## Configuration & Secrets
 
-**Source:** `.env` file (DO NOT COMMIT - in `.gitignore`)
+**Source:** first existing of `--config PATH` / `$MYWHOOSH_TO_GARMIN_CONFIG`,
+`~/.config/mywhoosh-to-garmin/config.env`, `./.env` (DO NOT COMMIT - in `.gitignore`).
+Lookup lives in `config.py`; real environment variables override the file.
 
 **Required:**
 ```
@@ -127,7 +129,7 @@ GARMIN_PASSWORD=password
 LOG_LEVEL=INFO  # Optional, defaults to INFO
 ```
 
-**Loading:** `main.py:load_config()` uses `python-dotenv`
+**Loading:** `main.py:load_config()` → `config.load_config_file()` (`python-dotenv`)
 - Validates all required vars present
 - Raises `ValueError` if missing (exit code 2)
 
@@ -170,7 +172,7 @@ python main.py --batch 2 2>&1 | tee debug.log
 **Common issues:**
 - 409 Conflict = Activity exists (success, no retry)
 - Date parse warning = Timestamp format not recognized (continues without dup check)
-- Auth error = Check `.env` credentials
+- Auth error = Check credentials in the config file (path is logged at startup)
 
 ## Dependencies & Integration Points
 

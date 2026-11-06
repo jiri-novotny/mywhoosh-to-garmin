@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from dotenv import load_dotenv  # noqa: E402
+from config import load_config_file  # noqa: E402
 from fit_tool.fit_file import FitFile  # noqa: E402
 from fit_tool.profile.messages.session_message import SessionMessage  # noqa: E402
 from garminconnect import Garmin  # noqa: E402
@@ -73,12 +73,13 @@ def main():
     parser.add_argument("--limit", type=int, default=5, help="number of latest MyWhoosh activities")
     parser.add_argument("--tolerance", type=int, default=600, help="allowed seconds of the MyWhoosh ride outside the Garmin activity")
     parser.add_argument("--out", default="connector_check", help="directory for downloaded files")
+    parser.add_argument("--config", help="config file (default: ~/.config/mywhoosh-to-garmin/config.env, then ./.env)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING,
                         format="%(levelname)s %(name)s: %(message)s")
-    load_dotenv()
+    print(f"[config] {load_config_file(args.config) or 'environment variables only'}")
     os.makedirs(args.out, exist_ok=True)
 
     # --- MyWhoosh -----------------------------------------------------------
