@@ -129,6 +129,21 @@ def main() -> int:
         action='store_true',
         help='Skip duplicate checking (faster but may upload duplicates)'
     )
+    parser.add_argument(
+        '--merge',
+        action='store_true',
+        help='Merge MyWhoosh rides into the matching watch recordings on Garmin Connect '
+             '(replaces the watch activity; the original is kept in --backup-dir). '
+             'Processes the latest ride, or --batch COUNT rides.'
+    )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='With --merge: only write merged FIT files to --output-dir, change nothing on Garmin'
+    )
+    parser.add_argument('--output-dir', default='merged', help='Dry-run output directory (default: merged)')
+    parser.add_argument('--backup-dir', default='backups',
+                        help='Where original watch FIT files are saved before replacing (default: backups)')
     args = parser.parse_args()
     
     try:
@@ -174,7 +189,15 @@ def main() -> int:
         check_duplicates = not args.no_duplicates
         
         # Choose sync mode
-        if args.batch:
+        if args.merge:
+            stats = processor.process_merge(
+                limit=args.batch or 1,
+                dry_run=args.dry_run,
+                output_dir=args.output_dir,
+                backup_dir=args.backup_dir,
+            )
+            success = stats['errors'] == 0
+        elif args.batch:
             # Batch mode: sync multiple activities
             stats = processor.process_multiple_activities(
                 limit=args.batch,

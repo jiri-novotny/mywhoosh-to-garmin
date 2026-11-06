@@ -161,6 +161,40 @@ This is **normal behavior** - the activity has already been uploaded to Garmin C
 
 ## Advanced Usage
 
+### Merging with a Watch Recording (`--merge`)
+
+If you also record the ride on a Garmin watch (e.g. as "Indoor Cycling"), merge mode
+combines both into one activity instead of uploading a second one:
+
+- **From the watch (kept as-is):** device and sensors, laps, heart rate, power,
+  respiration, L/R balance, training effect, training load, time in zones.
+- **From MyWhoosh:** GPS route and altitude, virtual speed and distance (session and
+  lap totals, ascent/descent are recomputed). The activity becomes "Virtual Cycling".
+
+```bash
+# Preview: write merged files to ./merged, change nothing on Garmin
+python main.py --merge --batch 5 --dry-run
+
+# Replace the watch activities with the merged ones
+python main.py --merge --batch 5
+```
+
+How it works:
+1. MyWhoosh rides are matched to Garmin cycling activities by **time overlap**. Several
+   MyWhoosh rides inside one watch recording (routes ridden back to back) are merged into
+   that one activity.
+2. The original watch FIT file is downloaded to `./backups` (kept permanently), merged
+   with the MyWhoosh file(s), and uploaded. The watch activity is then **deleted** from
+   Garmin Connect and the new one is named after the MyWhoosh route(s).
+3. Rides already on Garmin as "Virtual Cycling" (merged or uploaded earlier) are skipped.
+   Rides with no watch recording are uploaded the normal way.
+
+Note: deleting the watch activity also removes anything you added to it in Garmin Connect
+(notes, gear, photos). To restore an original, upload its file from `./backups`.
+
+Garmin accounts with MFA: run once interactively to enter the code; tokens are cached in
+`~/.garminconnect` (or `$GARMINTOKENS`).
+
 ### Running as a Cron Job
 
 To automatically sync after each ride, add to your crontab:

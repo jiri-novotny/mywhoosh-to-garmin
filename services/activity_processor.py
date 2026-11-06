@@ -1,10 +1,12 @@
 """Activity processor for orchestrating the MyWhoosh to Garmin workflow."""
 
 import logging
-from typing import Optional
-from datetime import datetime
+import os
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
 from services.mywhoosh_service import MyWhooshService
 from services.fit_file_service import FitFileService
+from services.fit_merge_service import FitMergeService
 from services.garmin_service import GarminService
 
 
@@ -14,7 +16,8 @@ class ActivityProcessor:
     def __init__(self,
                  mywhoosh_service: MyWhooshService,
                  fit_file_service: FitFileService,
-                 garmin_service: GarminService):
+                 garmin_service: GarminService,
+                 fit_merge_service: Optional[FitMergeService] = None):
         """Initialize ActivityProcessor with injected services.
 
         Args:
@@ -25,6 +28,7 @@ class ActivityProcessor:
         self.mywhoosh_service = mywhoosh_service
         self.fit_file_service = fit_file_service
         self.garmin_service = garmin_service
+        self.fit_merge_service = fit_merge_service or FitMergeService()
         self.logger = logging.getLogger(__name__)
 
     def process_latest_activity(self, check_duplicates: bool = True) -> bool:
@@ -327,3 +331,175 @@ class ActivityProcessor:
             self.logger.exception(f"Error: {e}")
             return stats
 
+
+    # ------------------------------------------------------------------
+    # Merge mode: MyWhoosh route + watch recording -> one Garmin activity
+    # ------------------------------------------------------------------
+
+    MYWHOOSH_TITLE_PREFIX = "MyWhoosh - "
+    # Extra MyWhoosh rides fetched so that every ride inside a watch recording is
+    # merged, even if some of them fall outside the requested limit.
+    LOOKAHEAD = 10
+
+    @staticmethod
+    def _mywhoosh_window(activity: Dict[str, Any]) -> Optional[Tuple[datetime, datetime]]:
+        """(start_utc, end_utc) of a MyWhoosh listing entry, from startDatetime/date + rideDuration."""
+        start = None
+        if activity.get('startDatetime'):
+            start = datetime.fromisoformat(activity['startDatetime'].replace('Z', '+00:00'))
+        elif isinstance(activity.get('date'), (int, float)):
+            start = datetime.fromtimestamp(activity['date'], tz=timezone.utc)
+        duration = activity.get('rideDuration')
+        if start is None or not duration:
+            return None
+        h, m, sec = duration.split(':')
+        return start, start + timedelta(hours=int(h), minutes=int(m), seconds=float(sec))
+
+    @classmethod
+    def _merged_name(cls, rides: List[Dict[str, Any]]) -> str:
+        titles = []
+        for ride in rides:
+            title = ride.get('title') or ride.get('name') or ride.get('routeName') or 'Ride'
+            if title.startswith(cls.MYWHOOSH_TITLE_PREFIX):
+                title = title[len(cls.MYWHOOSH_TITLE_PREFIX):]
+            titles.append(title)
+        return cls.MYWHOOSH_TITLE_PREFIX + " + ".join(titles)
+
+    @staticmethod
+    def _is_mywhoosh_file(path: str) -> bool:
+        """MyWhoosh FIT files carry a 'mywhoosh.whoosh...' developer application id."""
+        with open(path, 'rb') as f:
+            return b'mywhoosh' in f.read()
+
+    def process_merge(self, limit: int = 1, dry_run: bool = False,
+                      output_dir: str = 'merged', backup_dir: str = 'backups') -> dict:
+        """Merge the latest MyWhoosh rides into the matching watch recordings on Garmin.
+
+        For every MyWhoosh ride, the overlapping cycling activity recorded by the
+        watch is downloaded, the MyWhoosh route/distance is merged into it and the
+        watch activity is replaced by the merged one. Rides with no watch recording
+        are uploaded as before (MyWhoosh file with Garmin device info).
+
+        Args:
+            limit: Number of latest MyWhoosh rides to process
+            dry_run: Only write merged files to `output_dir`; don't upload/delete anything
+            output_dir: Where merged files are written in dry-run mode
+            backup_dir: Where original watch FIT files are kept before replacing
+
+        Returns:
+            Stats dict: total, merged, uploaded, skipped, errors
+        """
+        stats = {'total': 0, 'merged': 0, 'uploaded': 0, 'skipped': 0, 'errors': 0}
+        self.logger.info("=" * 70)
+        self.logger.info(f"MyWhoosh + watch merge{' (dry run)' if dry_run else ''}")
+        self.logger.info("=" * 70)
+
+        self.mywhoosh_service.authenticate()
+        self.garmin_service.authenticate()
+
+        all_rides = self.mywhoosh_service.get_activities(limit=limit + self.LOOKAHEAD)
+        rides = all_rides[:limit]
+        stats['total'] = len(rides)
+        if not rides:
+            self.logger.info("No MyWhoosh activities found")
+            return stats
+
+        windows = {r['id']: self._mywhoosh_window(r) for r in all_rides}
+
+        # Group the requested rides by the Garmin activity that covers them.
+        groups: Dict[int, Dict[str, Any]] = {}
+        unmatched = []
+        for ride in rides:
+            window = windows.get(ride['id'])
+            if window is None:
+                self.logger.error(f"Cannot determine time window of MyWhoosh ride {ride['id']}")
+                stats['errors'] += 1
+                continue
+            matches = self.garmin_service.find_overlapping_activities(*window)
+            if any(self.garmin_service.is_virtual_ride(m) for m in matches):
+                self.logger.info(f"'{ride.get('title')}': already on Garmin as a virtual ride - skipping")
+                stats['skipped'] += 1
+            elif matches:
+                garmin = matches[0]
+                groups.setdefault(int(garmin['activityId']), {'garmin': garmin, 'rides': []})
+            else:
+                unmatched.append(ride)
+
+        # Each group gets *all* MyWhoosh rides inside the watch recording.
+        for gid, group in groups.items():
+            g_start, g_end = self.garmin_service.activity_window(group['garmin'])
+            group['rides'] = sorted(
+                (r for r in all_rides if windows.get(r['id'])
+                 and windows[r['id']][0] < g_end and windows[r['id']][1] > g_start),
+                key=lambda r: windows[r['id']][0])
+            requested = sum(1 for r in group['rides'] if r in rides)
+            try:
+                self._merge_group(gid, group['garmin'], group['rides'], dry_run, output_dir, backup_dir)
+                stats['merged'] += requested
+            except Exception as e:
+                self.logger.exception(f"✗ Failed to merge into Garmin activity {gid}: {e}")
+                stats['errors'] += requested
+
+        for ride in unmatched:
+            self.logger.info(f"'{ride.get('title')}': no watch recording found - uploading MyWhoosh file")
+            if dry_run:
+                stats['skipped'] += 1
+                continue
+            if self._upload_mywhoosh_ride(ride):
+                stats['uploaded'] += 1
+            else:
+                stats['errors'] += 1
+
+        self.logger.info("=" * 70)
+        self.logger.info(f"Merge summary: {stats}")
+        self.logger.info("=" * 70)
+        return stats
+
+    def _merge_group(self, garmin_id: int, garmin: Dict[str, Any], rides: List[Dict[str, Any]],
+                     dry_run: bool, output_dir: str, backup_dir: str) -> None:
+        name = self._merged_name(rides)
+        self.logger.info(f"Garmin activity {garmin_id} '{garmin.get('activityName')}' "
+                         f"<- {len(rides)} MyWhoosh ride(s): {name}")
+
+        backup_path = os.path.join(backup_dir, f"garmin_{garmin_id}.fit")
+        self.garmin_service.download_original_fit(garmin_id, backup_path)
+        if self._is_mywhoosh_file(backup_path):
+            raise RuntimeError(f"Garmin activity {garmin_id} is a MyWhoosh upload, not a watch recording")
+
+        mywhoosh_paths = []
+        merged_path = None
+        try:
+            for ride in rides:
+                mywhoosh_paths.append(self.mywhoosh_service.download_activity(ride))
+            if dry_run:
+                os.makedirs(output_dir, exist_ok=True)
+                merged_path = os.path.join(output_dir, f"merged_{garmin_id}.fit")
+            merged_path = self.fit_merge_service.merge(backup_path, mywhoosh_paths, merged_path)
+
+            if dry_run:
+                self.logger.info(f"Dry run: merged file written to {merged_path}")
+                return
+            new_id = self.garmin_service.replace_activity(garmin, merged_path, backup_path, name)
+            self.logger.info(f"✓ Replaced Garmin activity {garmin_id} with merged activity {new_id}")
+        finally:
+            for path in mywhoosh_paths:
+                self.fit_file_service.cleanup_file(path)
+            if merged_path and not dry_run:
+                self.fit_file_service.cleanup_file(merged_path)
+
+    def _upload_mywhoosh_ride(self, ride: Dict[str, Any]) -> bool:
+        """Previous behaviour: upload the MyWhoosh file with Garmin device info."""
+        original = modified = None
+        try:
+            original = self.mywhoosh_service.download_activity(ride)
+            modified = self.fit_file_service.modify_device_info(original)
+            self.garmin_service.upload_activity(modified)
+            self.logger.info(f"✓ Uploaded '{ride.get('title')}'")
+            return True
+        except Exception as e:
+            self.logger.exception(f"✗ Failed to upload '{ride.get('title')}': {e}")
+            return False
+        finally:
+            for path in (original, modified):
+                if path:
+                    self.fit_file_service.cleanup_file(path)

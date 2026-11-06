@@ -47,3 +47,8 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
+connector_check/
+
+# Merge mode output
+merged/
+backups/
