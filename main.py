@@ -76,6 +76,7 @@ def load_config() -> dict:
         'garmin_username': os.getenv('GARMIN_USERNAME'),
         'garmin_password': os.getenv('GARMIN_PASSWORD'),
         'log_level': os.getenv('LOG_LEVEL', 'INFO'),
+        'garmin_device_serial': os.getenv('GARMIN_DEVICE_SERIAL') or None,
     }
     
     # Validate required configuration
@@ -88,6 +89,15 @@ def load_config() -> dict:
     
     missing = [k for k in required_keys if not config[k]]
     
+    if config['garmin_device_serial'] is not None:
+        try:
+            config['garmin_device_serial'] = int(config['garmin_device_serial'])
+        except ValueError:
+            raise ValueError(
+                f"Invalid GARMIN_DEVICE_SERIAL: '{config['garmin_device_serial']}' "
+                f"(must be a number, e.g. 3412345678)"
+            )
+
     if missing:
         missing_vars = [k.upper() for k in missing]
         raise ValueError(
@@ -144,7 +154,7 @@ def main() -> int:
             config['mywhoosh_password']
         )
         
-        fit_file_service = FitFileService()
+        fit_file_service = FitFileService(serial_number=config['garmin_device_serial'])
         
         garmin_service = GarminService(
             config['garmin_username'],

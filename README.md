@@ -84,6 +84,7 @@ The application follows these steps:
 | `GARMIN_USERNAME` | Yes | Your Garmin Connect username | - |
 | `GARMIN_PASSWORD` | Yes | Your Garmin Connect password | - |
 | `LOG_LEVEL` | No | Logging level (DEBUG, INFO, WARNING, ERROR) | INFO |
+| `GARMIN_DEVICE_SERIAL` | No | Device serial number written into the FIT file (e.g. your real Edge's serial, so Garmin Connect links the activity to that device) | keep original |
 
 ### Device Settings
 
