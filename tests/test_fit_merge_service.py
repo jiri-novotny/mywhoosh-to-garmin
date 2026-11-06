@@ -184,3 +184,31 @@ def test_find_overlapping_activities_matches_by_overlap():
     found = svc.find_overlapping_activities(start, end)
     assert [a['activityId'] for a in found] == [1]
     assert svc.find_overlapping_activities(start, end, exclude_ids=[1]) == []
+
+
+def _garmin_with(activities):
+    svc = GarminService('u', 'p', tokenstore='/nonexistent')
+    svc._authenticated = True
+    svc.client = MagicMock()
+    svc.client.get_activities_by_date.return_value = activities
+    return svc
+
+
+WATCH_NOV3 = {'activityId': 24947066353, 'activityName': 'Indoor Cycling',
+              'startTimeGMT': '2026-11-03 04:07:54', 'startTimeLocal': '2026-11-03 05:07:54',
+              'elapsedDuration': 2460, 'activityType': {'typeKey': 'indoor_cycling'}}
+RIDE_NOV3 = {'id': 'x', 'title': 'MyWhoosh - Mount Grizzly', 'date': 1793678915,
+             'startDatetime': '2026-11-03T04:08:35.000Z', 'rideDuration': '00:39:11.000'}
+
+
+def test_watch_recording_counts_as_duplicate_regardless_of_name():
+    """Regression: 'Indoor Cycling' did not name-match the MyWhoosh title and was re-uploaded."""
+    processor = ActivityProcessor(MagicMock(), MagicMock(), _garmin_with([WATCH_NOV3]))
+    assert processor._is_on_garmin(RIDE_NOV3, RIDE_NOV3['date'], RIDE_NOV3['title'])
+
+
+def test_fallback_duplicate_check_compares_in_utc():
+    svc = _garmin_with([WATCH_NOV3])
+    ride_start = ActivityProcessor(MagicMock(), MagicMock(), svc)._parse_activity_date(1793678915)
+    assert ride_start.tzinfo is not None
+    assert svc.check_duplicate_activity(ride_start, 'MyWhoosh - Mount Grizzly', threshold_hours=0.1)

@@ -83,26 +83,12 @@ class ActivityProcessor:
                 if not self.garmin_service.is_authenticated():
                     self.garmin_service.authenticate()
 
-                # Parse activity date for duplicate checking
-                activity_date = self._parse_activity_date(activity_date_str)
-
-                if activity_date:
-                    is_duplicate = self.garmin_service.check_duplicate_activity(
-                        activity_date,
-                        activity_name
-                    )
-
-                    if is_duplicate:
-                        self.logger.warning("⚠ Duplicate activity found - skipping upload")
-                        self.logger.info("=" * 70)
-                        self.logger.info("✓ Sync completed (duplicate skipped)")
-                        self.logger.info("=" * 70)
-                        return True  # Not an error - just skipped
-                else:
-                    self.logger.warning(
-                        f"Could not parse activity date: {activity_date_str}. "
-                        f"Continuing with upload..."
-                    )
+                if self._is_on_garmin(latest_activity, activity_date_str, activity_name):
+                    self.logger.warning("⚠ Duplicate activity found - skipping upload")
+                    self.logger.info("=" * 70)
+                    self.logger.info("✓ Sync completed (duplicate skipped)")
+                    self.logger.info("=" * 70)
+                    return True  # Not an error - just skipped
             else:
                 self.logger.info("Step 3: Duplicate check disabled - skipping")
 
@@ -151,6 +137,33 @@ class ActivityProcessor:
                 self.fit_file_service.cleanup_file(modified_file_path)
             self.logger.info("Cleanup complete")
 
+    def _is_on_garmin(self, activity: Dict[str, Any], activity_date_str: Any, activity_name: str) -> bool:
+        """True if the ride already exists on Garmin Connect.
+
+        Any cycling activity covering the ride counts, whatever its name: a watch
+        recording of the same ride ("Indoor Cycling") is a duplicate too.
+        """
+        window = self._mywhoosh_window(activity)
+        if window is None:
+            # No start/duration in the listing: fall back to the time-window check.
+            activity_date = self._parse_activity_date(activity_date_str)
+            if activity_date is None:
+                self.logger.warning(f"Could not parse activity date: {activity_date_str}. "
+                                    f"Continuing with upload...")
+                return False
+            return self.garmin_service.check_duplicate_activity(activity_date, activity_name)
+
+        matches = self.garmin_service.find_overlapping_activities(*window)
+        if not matches:
+            self.logger.info("No overlapping activity on Garmin Connect")
+            return False
+        for match in matches:
+            self.logger.info(f"Overlapping Garmin activity: '{match.get('activityName')}' "
+                             f"({match.get('activityId')}, {match.get('startTimeGMT')} UTC)")
+        if not any(self.garmin_service.is_virtual_ride(m) for m in matches):
+            self.logger.info("Ride was recorded by the watch - use --merge to add the MyWhoosh route to it")
+        return True
+
     def _parse_activity_date(self, date_str: Optional[str]) -> Optional[datetime]:
         """Parse activity date from various possible formats.
 
@@ -170,7 +183,7 @@ class ActivityProcessor:
             # If > 100 billion, likely milliseconds
             if timestamp > 100_000_000_000:
                 timestamp = timestamp / 1000
-            return datetime.fromtimestamp(timestamp)
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
         except (ValueError, AttributeError, OSError):
             pass
 
@@ -263,17 +276,10 @@ class ActivityProcessor:
                     self.logger.info(f"Activity: {activity_name} (ID: {activity_id})")
 
                     # Check for duplicates if enabled
-                    if check_duplicates:
-                        activity_date = self._parse_activity_date(activity_date_str)
-                        if activity_date:
-                            is_duplicate = self.garmin_service.check_duplicate_activity(
-                                activity_date,
-                                activity_name
-                            )
-                            if is_duplicate:
-                                self.logger.warning("⚠ Duplicate activity - skipping")
-                                stats['skipped'] += 1
-                                continue
+                    if check_duplicates and self._is_on_garmin(activity, activity_date_str, activity_name):
+                        self.logger.warning("⚠ Duplicate activity - skipping")
+                        stats['skipped'] += 1
+                        continue
 
                     # Download and sync activity
                     original_file_path = None
@@ -416,12 +422,18 @@ class ActivityProcessor:
                 stats['errors'] += 1
                 continue
             matches = self.garmin_service.find_overlapping_activities(*window)
-            if any(self.garmin_service.is_virtual_ride(m) for m in matches):
+            watch = [m for m in matches if not self.garmin_service.is_virtual_ride(m)]
+            virtual = [m for m in matches if self.garmin_service.is_virtual_ride(m)]
+            if watch:
+                group = groups.setdefault(int(watch[0]['activityId']),
+                                          {'garmin': watch[0], 'rides': [], 'stale': {}})
+                # Virtual rides next to a watch recording are leftovers of a plain
+                # MyWhoosh upload; they are removed once the merge succeeded.
+                for v in virtual:
+                    group['stale'][int(v['activityId'])] = v
+            elif virtual:
                 self.logger.info(f"'{ride.get('title')}': already on Garmin as a virtual ride - skipping")
                 stats['skipped'] += 1
-            elif matches:
-                garmin = matches[0]
-                groups.setdefault(int(garmin['activityId']), {'garmin': garmin, 'rides': []})
             else:
                 unmatched.append(ride)
 
@@ -434,7 +446,8 @@ class ActivityProcessor:
                 key=lambda r: windows[r['id']][0])
             requested = sum(1 for r in group['rides'] if r in rides)
             try:
-                self._merge_group(gid, group['garmin'], group['rides'], dry_run, output_dir, backup_dir)
+                self._merge_group(gid, group['garmin'], group['rides'], dry_run, output_dir, backup_dir,
+                                  stale=list(group['stale'].values()))
                 stats['merged'] += requested
             except Exception as e:
                 self.logger.exception(f"✗ Failed to merge into Garmin activity {gid}: {e}")
@@ -456,7 +469,8 @@ class ActivityProcessor:
         return stats
 
     def _merge_group(self, garmin_id: int, garmin: Dict[str, Any], rides: List[Dict[str, Any]],
-                     dry_run: bool, output_dir: str, backup_dir: str) -> None:
+                     dry_run: bool, output_dir: str, backup_dir: str,
+                     stale: Optional[List[Dict[str, Any]]] = None) -> None:
         name = self._merged_name(rides)
         self.logger.info(f"Garmin activity {garmin_id} '{garmin.get('activityName')}' "
                          f"<- {len(rides)} MyWhoosh ride(s): {name}")
@@ -465,6 +479,16 @@ class ActivityProcessor:
         self.garmin_service.download_original_fit(garmin_id, backup_path)
         if self._is_mywhoosh_file(backup_path):
             raise RuntimeError(f"Garmin activity {garmin_id} is a MyWhoosh upload, not a watch recording")
+
+        # Only delete leftovers that really are MyWhoosh files (kept in backups too).
+        stale_ids = []
+        for activity in stale or []:
+            sid = int(activity['activityId'])
+            path = self.garmin_service.download_original_fit(sid, os.path.join(backup_dir, f"garmin_{sid}.fit"))
+            if not self._is_mywhoosh_file(path):
+                raise RuntimeError(f"Garmin activity {sid} '{activity.get('activityName')}' overlaps the "
+                                   f"watch recording but is not a MyWhoosh upload - resolve manually")
+            stale_ids.append(sid)
 
         mywhoosh_paths = []
         merged_path = None
@@ -478,9 +502,15 @@ class ActivityProcessor:
 
             if dry_run:
                 self.logger.info(f"Dry run: merged file written to {merged_path}")
+                for sid in stale_ids:
+                    self.logger.info(f"Dry run: would delete duplicate MyWhoosh upload {sid}")
                 return
-            new_id = self.garmin_service.replace_activity(garmin, merged_path, backup_path, name)
+            new_id = self.garmin_service.replace_activity(
+                garmin, merged_path, backup_path, name, exclude_ids=stale_ids)
             self.logger.info(f"✓ Replaced Garmin activity {garmin_id} with merged activity {new_id}")
+            for sid in stale_ids:
+                self.garmin_service.client.delete_activity(sid)
+                self.logger.info(f"Deleted duplicate MyWhoosh upload {sid} (backup in {backup_dir})")
         finally:
             for path in mywhoosh_paths:
                 self.fit_file_service.cleanup_file(path)

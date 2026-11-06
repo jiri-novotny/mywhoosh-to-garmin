@@ -73,7 +73,7 @@ class FitFileService:
         Args:
             fit_file_path: Path to the original FIT file
             manufacturer: Device manufacturer (defaults to Garmin - ID 1)
-            product: Device product (defaults to Edge 840 - ID 4024)
+            product: Device product (defaults to Enduro 3 - ID 4575)
             software_version: Software version (defaults to 23.39)
             serial_number: Device serial number (defaults to the value passed to
                 the constructor; if neither is set, the original serial is kept)
@@ -88,7 +88,7 @@ class FitFileService:
         if not os.path.exists(fit_file_path):
             raise FileNotFoundError(f"FIT file not found: {fit_file_path}")
 
-        # Set defaults for Garmin Edge 840
+        # Defaults: Garmin Enduro 3
         manufacturer = manufacturer or Manufacturer.GARMIN.value
         product = product or 4575
         software_version = software_version or 23.39
@@ -97,7 +97,7 @@ class FitFileService:
 
         self.logger.info(f"Modifying FIT file: {fit_file_path}")
         self.logger.info(
-            f"Target device: Garmin Edge 840 "
+            f"Target device: "
             f"(manufacturer: {manufacturer}, product: {product}, sw: {software_version}, "
             f"serial: {serial_number if serial_number is not None else 'unchanged'})"
         )

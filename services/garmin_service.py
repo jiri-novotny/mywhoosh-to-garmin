@@ -219,7 +219,8 @@ class GarminService:
             time.sleep(interval_s)
 
     def replace_activity(self, original: Dict[str, Any], new_fit_path: str,
-                         backup_fit_path: str, name: Optional[str] = None) -> int:
+                         backup_fit_path: str, name: Optional[str] = None,
+                         exclude_ids: Iterable[int] = ()) -> int:
         """Replace a Garmin activity with a new FIT file. Returns the new activity id.
 
         Order of operations keeps the original as long as possible:
@@ -228,6 +229,8 @@ class GarminService:
         2. wait until the new activity is visible, then delete the original;
         3. set the activity name.
         If the upload after deleting fails, the backup of the original is re-uploaded.
+        `exclude_ids` are other activities in the same time window that must not be
+        mistaken for the new upload.
         """
         original_id = int(original["activityId"])
         start, end = self.activity_window(original)
@@ -247,7 +250,8 @@ class GarminService:
                 self.upload_activity(backup_fit_path)
                 raise
 
-        new_activity = self._wait_for_new_activity(start, end, exclude_ids=[original_id])
+        new_activity = self._wait_for_new_activity(start, end,
+                                                   exclude_ids=[original_id, *exclude_ids])
         new_id = int(new_activity["activityId"])
         self.logger.info(f"Merged activity uploaded as {new_id}")
 
@@ -277,18 +281,12 @@ class GarminService:
         activity_name: Optional[str] = None,
         threshold_hours: int = 2
     ) -> bool:
-        """Check if an activity already exists on Garmin Connect.
+        """Check if a cycling activity starts within threshold_hours of activity_date.
 
-        Uses a time window approach: if an activity exists within
-        threshold_hours of the given activity_date, it's considered a duplicate.
-
-        Args:
-            activity_date: Date/time when the activity occurred
-            activity_name: Optional activity name for additional matching
-            threshold_hours: Time window in hours (default: 2)
-
-        Returns:
-            True if duplicate found, False otherwise
+        Fallback used when the ride's duration is unknown (otherwise see
+        find_overlapping_activities). Times are compared in UTC; naive datetimes
+        are treated as UTC. The name is only logged: a watch recording of the same
+        ride is a duplicate even though it is called e.g. "Indoor Cycling".
 
         Raises:
             RuntimeError: If not authenticated
@@ -296,63 +294,27 @@ class GarminService:
         if not self._authenticated:
             raise RuntimeError("Must authenticate before checking activities")
 
+        if activity_date.tzinfo is None:
+            activity_date = activity_date.replace(tzinfo=timezone.utc)
         self.logger.info(
-            f"Checking for duplicate activity around {activity_date} "
-            f"(±{threshold_hours}h window)"
+            f"Checking for duplicate of '{activity_name}' around "
+            f"{activity_date:%Y-%m-%d %H:%M:%S} UTC (±{threshold_hours}h window)"
         )
-
         try:
-            # Get activities for the date
-            date_str = activity_date.strftime('%Y-%m-%d')
-            activities = self.client.get_activities_by_date(date_str, date_str)
-
-            if not activities:
-                self.logger.info("No activities found on this date")
-                return False
-
-            self.logger.info(f"Found {len(activities)} activities on {date_str}")
-
-            # Check each activity
+            day = activity_date.date()
+            activities = self.client.get_activities_by_date(
+                (day - timedelta(days=1)).isoformat(), (day + timedelta(days=1)).isoformat()) or []
             for activity in activities:
-                try:
-                    # Parse activity start time
-                    start_time_str = activity.get('startTimeLocal', activity.get('startTime'))
-                    if not start_time_str:
-                        continue
-
-                    # Handle different time formats
-                    start_time_str = start_time_str.replace('Z', '+00:00')
-                    activity_start = datetime.fromisoformat(start_time_str)
-
-                    # Calculate time difference in hours
-                    time_diff = abs((activity_start - activity_date).total_seconds() / 3600)
-
-                    if time_diff <= threshold_hours:
-                        self.logger.info(
-                            f"Found potential duplicate: '{activity.get('activityName')}' "
-                            f"at {activity_start} (Δ{time_diff:.1f}h)"
-                        )
-
-                        # Additional name matching if provided
-                        if activity_name:
-                            garmin_name = activity.get('activityName', '').lower()
-                            if activity_name.lower() in garmin_name or garmin_name in activity_name.lower():
-                                self.logger.info("✓ Activity name matches - confirmed duplicate")
-                                return True
-                            else:
-                                self.logger.info("✗ Activity name doesn't match, checking next...")
-                                continue
-                        else:
-                            # No name provided, time match is sufficient
-                            return True
-
-                except Exception as e:
-                    self.logger.warning(f"Error parsing activity: {e}")
+                window = self.activity_window(activity)
+                if window is None or not self.is_cycling(activity):
                     continue
-
+                diff_h = abs((window[0] - activity_date).total_seconds()) / 3600
+                if diff_h <= threshold_hours:
+                    self.logger.info(f"Found duplicate: '{activity.get('activityName')}' "
+                                     f"at {window[0]:%Y-%m-%d %H:%M:%S} UTC (Δ{diff_h:.1f}h)")
+                    return True
             self.logger.info("No duplicate found")
             return False
-
         except Exception as e:
             self.logger.warning(f"Error checking for duplicates: {e}")
             # Don't block upload if duplicate check fails

@@ -2,7 +2,7 @@
 """
 MyWhoosh to Garmin Connect Activity Sync
 
-Fetches activities from MyWhoosh, modifies the device type to Garmin Edge 840,
+Fetches activities from MyWhoosh, attributes them to a Garmin device,
 and uploads them to Garmin Connect with automatic duplicate detection.
 
 Usage:
