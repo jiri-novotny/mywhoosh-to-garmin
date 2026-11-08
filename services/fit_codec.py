@@ -115,6 +115,26 @@ class DataMessage:
                 return f
         return None
 
+    def get_string(self, num: int) -> Optional[str]:
+        """Decode a string field (NUL-terminated UTF-8), or None if absent/empty."""
+        fdef = self._field_def(num)
+        if fdef is None or fdef.base_type != 0x07:
+            return None
+        text = self._raw[num].split(b'\x00', 1)[0].decode('utf-8', errors='replace')
+        return text or None
+
+    def dev_value(self, dev_num: int, dev_index: int, fmt: str):
+        """Decode a scalar developer field (struct format char `fmt`), or None if absent."""
+        offset = 0
+        for num, size, idx in self.definition.dev_fields:
+            if (num, idx) == (dev_num, dev_index):
+                raw = self.dev_payload[offset:offset + size]
+                if len(raw) != struct.calcsize(fmt):
+                    return None
+                return struct.unpack(self.definition.endian + fmt, raw)[0]
+            offset += size
+        return None
+
     def get(self, num: int):
         """Return the decoded scalar value of a field, or None if absent/invalid."""
         fdef = self._field_def(num)
@@ -165,6 +185,17 @@ class FitData:
     def messages(self, global_num: Optional[int] = None) -> List[DataMessage]:
         return [r for r in self.records if isinstance(r, DataMessage)
                 and (global_num is None or r.global_num == global_num)]
+
+    def developer_field(self, name: str) -> Optional[Tuple[int, int, int]]:
+        """(field number, developer index, base type) of a developer field by name.
+
+        Field numbers are not stable between files, so look them up in the
+        field_description messages (global 206).
+        """
+        for desc in self.messages(206):
+            if desc.get_string(3) == name:
+                return desc.get(1), desc.get(0), desc.get(2)
+        return None
 
 
 def read_fit(path: str) -> FitData:

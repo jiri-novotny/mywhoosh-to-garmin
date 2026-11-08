@@ -20,8 +20,10 @@ from bisect import bisect_left
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from services.fit_codec import (DataMessage, FitData, ENUM, SINT32, UINT16,
-                                UINT32, read_fit, write_fit)
+from datetime import datetime, timezone
+
+from services.fit_codec import (DataMessage, FitData, ENUM, FIT_EPOCH_OFFSET, SINT32,
+                                UINT16, UINT32, read_fit, write_fit)
 
 # Global message numbers
 SPORT, SESSION, LAP, RECORD = 12, 18, 19, 20
@@ -115,6 +117,28 @@ class FitMergeService:
         write_fit(watch, output_path)
         self.logger.info(f"Merged FIT file saved to {output_path}")
         return output_path
+
+    @staticmethod
+    def time_window(fit_path: str) -> Tuple[datetime, datetime]:
+        """(start_utc, end_utc) of an activity file, from its first/last record."""
+        timestamps = [m.timestamp for m in read_fit(fit_path).messages(RECORD) if m.timestamp is not None]
+        if not timestamps:
+            raise ValueError(f"No records in {fit_path}")
+
+        def to_utc(ts: int) -> datetime:
+            return datetime.fromtimestamp(ts + FIT_EPOCH_OFFSET, tz=timezone.utc)
+        return to_utc(min(timestamps)), to_utc(max(timestamps))
+
+    @staticmethod
+    def route_id(fit_path: str) -> Optional[int]:
+        """MyWhoosh route id (developer field "CurrentRouteId" in the session), or None."""
+        fit = read_fit(fit_path)
+        field = fit.developer_field('CurrentRouteId')
+        sessions = fit.messages(SESSION)
+        if field is None or not sessions:
+            return None
+        num, dev_index, _ = field
+        return sessions[0].dev_value(num, dev_index, 'I')
 
     # ------------------------------------------------------------- MyWhoosh in
 

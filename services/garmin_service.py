@@ -6,7 +6,7 @@ import os
 import sys
 import time
 import zipfile
-from typing import Dict, Any, Iterable, List, Optional, Union
+from typing import Callable, Dict, Any, Iterable, List, Optional, Union
 from datetime import datetime, timedelta, timezone
 from garminconnect import (
     Garmin,
@@ -219,7 +219,8 @@ class GarminService:
             time.sleep(interval_s)
 
     def replace_activity(self, original: Dict[str, Any], new_fit_path: str,
-                         backup_fit_path: str, name: Optional[str] = None,
+                         backup_fit_path: str,
+                         name: Union[str, Callable[[Dict[str, Any]], Optional[str]], None] = None,
                          exclude_ids: Iterable[int] = ()) -> int:
         """Replace a Garmin activity with a new FIT file. Returns the new activity id.
 
@@ -259,6 +260,8 @@ class GarminService:
             self.client.delete_activity(original_id)
             self.logger.info(f"Deleted original activity {original_id} (backup: {backup_fit_path})")
 
+        if callable(name):  # name derived from the new activity (e.g. Garmin's location name)
+            name = name(new_activity)
         if name:
             try:
                 self.client.set_activity_name(new_id, name)

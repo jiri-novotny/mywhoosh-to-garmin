@@ -79,6 +79,17 @@ python main.py --batch 10
 - Returns stats dict: `{'total': N, 'synced': N, 'skipped': N, 'errors': N}`
 - Used in `process_multiple_activities()` (different workflow than single activity)
 
+### Merge Mode
+```bash
+python main.py --merge --batch 5 [--dry-run]
+python main.py --merge --file ride.fit [--file ride2.fit] [--name NAME]   # offline, no MyWhoosh login
+```
+- `process_merge()` / `process_merge_files()` → `_merge_rides()`: rides grouped by the
+  overlapping watch recording, merged by `FitMergeService` (lossless `fit_codec`),
+  watch activity replaced via `GarminService.replace_activity()` (backup in `backups/`)
+- MyWhoosh allows one session per account: login fails with "already logged in from
+  another device" while the app is logged in elsewhere → use `--file`
+
 ### Skip Duplicate Check
 ```bash
 python main.py --batch 10 --no-duplicates

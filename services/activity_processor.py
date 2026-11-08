@@ -8,6 +8,7 @@ from services.mywhoosh_service import MyWhooshService
 from services.fit_file_service import FitFileService
 from services.fit_merge_service import FitMergeService
 from services.garmin_service import GarminService
+from services.route_names import RouteNameCache
 
 
 class ActivityProcessor:
@@ -17,7 +18,8 @@ class ActivityProcessor:
                  mywhoosh_service: MyWhooshService,
                  fit_file_service: FitFileService,
                  garmin_service: GarminService,
-                 fit_merge_service: Optional[FitMergeService] = None):
+                 fit_merge_service: Optional[FitMergeService] = None,
+                 route_names: Optional[RouteNameCache] = None):
         """Initialize ActivityProcessor with injected services.
 
         Args:
@@ -29,6 +31,7 @@ class ActivityProcessor:
         self.fit_file_service = fit_file_service
         self.garmin_service = garmin_service
         self.fit_merge_service = fit_merge_service or FitMergeService()
+        self.route_names = route_names or RouteNameCache()
         self.logger = logging.getLogger(__name__)
 
     def process_latest_activity(self, check_duplicates: bool = True) -> bool:
@@ -371,6 +374,28 @@ class ActivityProcessor:
             titles.append(title)
         return cls.MYWHOOSH_TITLE_PREFIX + " + ".join(titles)
 
+    @classmethod
+    def _strip_prefix(cls, title: Optional[str]) -> Optional[str]:
+        if title and title.startswith(cls.MYWHOOSH_TITLE_PREFIX):
+            title = title[len(cls.MYWHOOSH_TITLE_PREFIX):]
+        return title or None
+
+    @classmethod
+    def _with_prefix(cls, title: str) -> str:
+        return title if title.startswith(cls.MYWHOOSH_TITLE_PREFIX) else cls.MYWHOOSH_TITLE_PREFIX + title
+
+    VIRTUAL_NAME_SUFFIXES = (" Virtual Cycling", " Virtual Ride", " Cycling")
+
+    @classmethod
+    def _name_from_garmin(cls, activity: Dict[str, Any]) -> Optional[str]:
+        """'Mompós Virtual Cycling' (Garmin's location-based name) -> 'MyWhoosh - Mompós'."""
+        place = (activity.get('activityName') or '').strip()
+        for suffix in cls.VIRTUAL_NAME_SUFFIXES:
+            if place.endswith(suffix):
+                place = place[:-len(suffix)].strip()
+                break
+        return cls.MYWHOOSH_TITLE_PREFIX + place if place else None
+
     @staticmethod
     def _is_mywhoosh_file(path: str) -> bool:
         """MyWhoosh FIT files carry a 'mywhoosh.whoosh...' developer application id."""
@@ -395,70 +420,116 @@ class ActivityProcessor:
         Returns:
             Stats dict: total, merged, uploaded, skipped, errors
         """
-        stats = {'total': 0, 'merged': 0, 'uploaded': 0, 'skipped': 0, 'errors': 0}
+        self._log_merge_header(dry_run)
+        self.mywhoosh_service.authenticate()
+        self.garmin_service.authenticate()
+
+        listing = self.mywhoosh_service.get_activities(limit=limit + self.LOOKAHEAD)
+        candidates = [{'id': a['id'], 'title': a.get('title') or a.get('name'),
+                       'window': self._mywhoosh_window(a), 'activity': a, 'path': None}
+                      for a in listing]
+        return self._merge_rides(candidates[:limit], candidates, dry_run, output_dir, backup_dir)
+
+    def process_merge_files(self, paths: List[str], name: Optional[str] = None, dry_run: bool = False,
+                            output_dir: str = 'merged', backup_dir: str = 'backups') -> dict:
+        """Offline variant of process_merge: MyWhoosh FIT files given locally, no MyWhoosh login.
+
+        Args:
+            paths: MyWhoosh FIT files (several rides inside one watch recording are merged together)
+            name: Activity name on Garmin ("MyWhoosh - " is prepended if missing). Default:
+                "MyWhoosh - <route>" if the route was seen online before (route cache),
+                otherwise "MyWhoosh - <place>" from the name Garmin assigns.
+        """
+        self._log_merge_header(dry_run)
+        self.garmin_service.authenticate()
+
+        rides = []
+        stats_errors = 0
+        for path in paths:
+            try:
+                window = self.fit_merge_service.time_window(path)
+            except Exception as e:
+                self.logger.error(f"Cannot read MyWhoosh file {path}: {e}")
+                stats_errors += 1
+                continue
+            route_id = self.fit_merge_service.route_id(path)
+            title = self.route_names.get(route_id)
+            self.logger.info(f"File {path}: {window[0]:%Y-%m-%d %H:%M:%S} - {window[1]:%H:%M:%S} UTC, "
+                             f"route {route_id}: {title or 'name unknown (not ridden online yet)'}")
+            rides.append({'id': os.path.abspath(path), 'title': title, 'window': window,
+                          'activity': None, 'path': path})
+        if name:
+            name = self._with_prefix(name)
+            if len(rides) == 1:  # remember it, so the next file of this route is named automatically
+                self.route_names.set(self.fit_merge_service.route_id(rides[0]['path']),
+                                     self._strip_prefix(name))
+        stats = self._merge_rides(rides, rides, dry_run, output_dir, backup_dir, name=name)
+        stats['total'] += stats_errors
+        stats['errors'] += stats_errors
+        return stats
+
+    def _log_merge_header(self, dry_run: bool) -> None:
         self.logger.info("=" * 70)
         self.logger.info(f"MyWhoosh + watch merge{' (dry run)' if dry_run else ''}")
         self.logger.info("=" * 70)
 
-        self.mywhoosh_service.authenticate()
-        self.garmin_service.authenticate()
+    def _merge_rides(self, rides: List[Dict[str, Any]], candidates: List[Dict[str, Any]],
+                     dry_run: bool, output_dir: str, backup_dir: str,
+                     name: Optional[str] = None) -> dict:
+        """Group rides by the watch recording that covers them and merge each group.
 
-        all_rides = self.mywhoosh_service.get_activities(limit=limit + self.LOOKAHEAD)
-        rides = all_rides[:limit]
-        stats['total'] = len(rides)
+        `rides` are the rides to process; `candidates` (a superset) are used to pull
+        in every ride that lies inside the same watch recording.
+        """
+        stats = {'total': len(rides), 'merged': 0, 'uploaded': 0, 'skipped': 0, 'errors': 0}
         if not rides:
-            self.logger.info("No MyWhoosh activities found")
+            self.logger.info("No MyWhoosh activities to process")
             return stats
 
-        windows = {r['id']: self._mywhoosh_window(r) for r in all_rides}
-
-        # Group the requested rides by the Garmin activity that covers them.
         groups: Dict[int, Dict[str, Any]] = {}
         unmatched = []
         for ride in rides:
-            window = windows.get(ride['id'])
-            if window is None:
+            if ride['window'] is None:
                 self.logger.error(f"Cannot determine time window of MyWhoosh ride {ride['id']}")
                 stats['errors'] += 1
                 continue
-            matches = self.garmin_service.find_overlapping_activities(*window)
+            matches = self.garmin_service.find_overlapping_activities(*ride['window'])
             watch = [m for m in matches if not self.garmin_service.is_virtual_ride(m)]
             virtual = [m for m in matches if self.garmin_service.is_virtual_ride(m)]
             if watch:
                 group = groups.setdefault(int(watch[0]['activityId']),
-                                          {'garmin': watch[0], 'rides': [], 'stale': {}})
+                                          {'garmin': watch[0], 'stale': {}})
                 # Virtual rides next to a watch recording are leftovers of a plain
                 # MyWhoosh upload; they are removed once the merge succeeded.
                 for v in virtual:
                     group['stale'][int(v['activityId'])] = v
             elif virtual:
-                self.logger.info(f"'{ride.get('title')}': already on Garmin as a virtual ride - skipping")
+                self.logger.info(f"'{ride['title'] or ride['id']}': already on Garmin as a virtual ride - skipping")
                 stats['skipped'] += 1
             else:
                 unmatched.append(ride)
 
-        # Each group gets *all* MyWhoosh rides inside the watch recording.
+        requested_ids = {r['id'] for r in rides}
         for gid, group in groups.items():
             g_start, g_end = self.garmin_service.activity_window(group['garmin'])
-            group['rides'] = sorted(
-                (r for r in all_rides if windows.get(r['id'])
-                 and windows[r['id']][0] < g_end and windows[r['id']][1] > g_start),
-                key=lambda r: windows[r['id']][0])
-            requested = sum(1 for r in group['rides'] if r in rides)
+            # Each group gets *all* candidate rides inside the watch recording.
+            members = sorted((c for c in candidates if c['window']
+                              and c['window'][0] < g_end and c['window'][1] > g_start),
+                             key=lambda c: c['window'][0])
+            requested = sum(1 for m in members if m['id'] in requested_ids)
             try:
-                self._merge_group(gid, group['garmin'], group['rides'], dry_run, output_dir, backup_dir,
-                                  stale=list(group['stale'].values()))
+                self._merge_group(gid, group['garmin'], members, dry_run, output_dir, backup_dir,
+                                  stale=list(group['stale'].values()), name=name)
                 stats['merged'] += requested
             except Exception as e:
                 self.logger.exception(f"✗ Failed to merge into Garmin activity {gid}: {e}")
                 stats['errors'] += requested
 
         for ride in unmatched:
-            self.logger.info(f"'{ride.get('title')}': no watch recording found - uploading MyWhoosh file")
+            self.logger.info(f"'{ride['title'] or ride['id']}': no watch recording found - uploading MyWhoosh file")
             if dry_run:
                 stats['skipped'] += 1
-                continue
-            if self._upload_mywhoosh_ride(ride):
+            elif self._upload_mywhoosh_ride(ride):
                 stats['uploaded'] += 1
             else:
                 stats['errors'] += 1
@@ -468,12 +539,28 @@ class ActivityProcessor:
         self.logger.info("=" * 70)
         return stats
 
+    def _ride_file(self, ride: Dict[str, Any]) -> Tuple[str, bool]:
+        """Return (path, is_temporary) of the ride's MyWhoosh FIT file."""
+        if ride['path']:
+            return ride['path'], False
+        path = self.mywhoosh_service.download_activity(ride['activity'])
+        try:  # remember the route name for offline files (their Title field is corrupted)
+            self.route_names.set(self.fit_merge_service.route_id(path), self._strip_prefix(ride['title']))
+        except Exception as e:
+            self.logger.debug(f"Could not record route name: {e}")
+        return path, True
+
     def _merge_group(self, garmin_id: int, garmin: Dict[str, Any], rides: List[Dict[str, Any]],
                      dry_run: bool, output_dir: str, backup_dir: str,
-                     stale: Optional[List[Dict[str, Any]]] = None) -> None:
-        name = self._merged_name(rides)
+                     stale: Optional[List[Dict[str, Any]]] = None,
+                     name: Optional[str] = None) -> None:
+        titles = [r['title'] for r in rides if r['title']]
+        if name is None and titles:
+            name = self._merged_name([{'title': t} for t in titles])
         self.logger.info(f"Garmin activity {garmin_id} '{garmin.get('activityName')}' "
-                         f"<- {len(rides)} MyWhoosh ride(s): {name}")
+                         f"<- {len(rides)} MyWhoosh ride(s): {name or 'MyWhoosh - <place named by Garmin>'}")
+        if name is None:
+            name = self._name_from_garmin
 
         backup_path = os.path.join(backup_dir, f"garmin_{garmin_id}.fit")
         self.garmin_service.download_original_fit(garmin_id, backup_path)
@@ -490,11 +577,15 @@ class ActivityProcessor:
                                    f"watch recording but is not a MyWhoosh upload - resolve manually")
             stale_ids.append(sid)
 
+        temp_paths = []
         mywhoosh_paths = []
         merged_path = None
         try:
             for ride in rides:
-                mywhoosh_paths.append(self.mywhoosh_service.download_activity(ride))
+                path, is_temp = self._ride_file(ride)
+                mywhoosh_paths.append(path)
+                if is_temp:
+                    temp_paths.append(path)
             if dry_run:
                 os.makedirs(output_dir, exist_ok=True)
                 merged_path = os.path.join(output_dir, f"merged_{garmin_id}.fit")
@@ -512,7 +603,7 @@ class ActivityProcessor:
                 self.garmin_service.client.delete_activity(sid)
                 self.logger.info(f"Deleted duplicate MyWhoosh upload {sid} (backup in {backup_dir})")
         finally:
-            for path in mywhoosh_paths:
+            for path in temp_paths:
                 self.fit_file_service.cleanup_file(path)
             if merged_path and not dry_run:
                 self.fit_file_service.cleanup_file(merged_path)
@@ -520,16 +611,19 @@ class ActivityProcessor:
     def _upload_mywhoosh_ride(self, ride: Dict[str, Any]) -> bool:
         """Previous behaviour: upload the MyWhoosh file with Garmin device info."""
         original = modified = None
+        is_temp = False
+        label = ride['title'] or ride['id']
         try:
-            original = self.mywhoosh_service.download_activity(ride)
+            original, is_temp = self._ride_file(ride)
             modified = self.fit_file_service.modify_device_info(original)
             self.garmin_service.upload_activity(modified)
-            self.logger.info(f"✓ Uploaded '{ride.get('title')}'")
+            self.logger.info(f"✓ Uploaded '{label}'")
             return True
         except Exception as e:
-            self.logger.exception(f"✗ Failed to upload '{ride.get('title')}': {e}")
+            self.logger.exception(f"✗ Failed to upload '{label}': {e}")
             return False
         finally:
-            for path in (original, modified):
-                if path:
-                    self.fit_file_service.cleanup_file(path)
+            if original and is_temp:
+                self.fit_file_service.cleanup_file(original)
+            if modified:
+                self.fit_file_service.cleanup_file(modified)

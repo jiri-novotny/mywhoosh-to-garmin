@@ -59,11 +59,12 @@ def setup_logging(log_level: str = 'INFO') -> None:
     root_logger.addHandler(file_handler)
 
 
-def load_config(config_path: str = None) -> dict:
+def load_config(config_path: str = None, need_mywhoosh: bool = True) -> dict:
     """Load configuration from the config file and environment variables.
 
     Args:
         config_path: Explicit config file (otherwise see config.py for lookup order)
+        need_mywhoosh: Whether MyWhoosh credentials are required (not for --file)
 
     Returns:
         Dictionary with configuration values
@@ -87,12 +88,9 @@ def load_config(config_path: str = None) -> dict:
     }
     
     # Validate required configuration
-    required_keys = [
-        'mywhoosh_email',
-        'mywhoosh_password',
-        'garmin_username',
-        'garmin_password'
-    ]
+    required_keys = ['garmin_username', 'garmin_password']
+    if need_mywhoosh:
+        required_keys = ['mywhoosh_email', 'mywhoosh_password'] + required_keys
     
     missing = [k for k in required_keys if not config[k]]
     
@@ -151,6 +149,17 @@ def main() -> int:
              'Processes the latest ride, or --batch COUNT rides.'
     )
     parser.add_argument(
+        '--file',
+        action='append',
+        metavar='PATH',
+        help='With --merge: use a MyWhoosh FIT file downloaded manually instead of the '
+             'MyWhoosh API (no MyWhoosh login). Repeat for several rides.'
+    )
+    parser.add_argument(
+        '--name',
+        help='With --file: activity name on Garmin Connect (default: keep the name Garmin assigns)'
+    )
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help='With --merge: only write merged FIT files to --output-dir, change nothing on Garmin'
@@ -159,10 +168,12 @@ def main() -> int:
     parser.add_argument('--backup-dir', default='backups',
                         help='Where original watch FIT files are saved before replacing (default: backups)')
     args = parser.parse_args()
+    if (args.file or args.name) and not args.merge:
+        parser.error('--file/--name require --merge')
     
     try:
         # Load configuration
-        config = load_config(args.config)
+        config = load_config(args.config, need_mywhoosh=not args.file)
         
         # Setup logging
         setup_logging(config['log_level'])
@@ -207,7 +218,16 @@ def main() -> int:
         check_duplicates = not args.no_duplicates
         
         # Choose sync mode
-        if args.merge:
+        if args.merge and args.file:
+            stats = processor.process_merge_files(
+                args.file,
+                name=args.name,
+                dry_run=args.dry_run,
+                output_dir=args.output_dir,
+                backup_dir=args.backup_dir,
+            )
+            success = stats['errors'] == 0
+        elif args.merge:
             stats = processor.process_merge(
                 limit=args.batch or 1,
                 dry_run=args.dry_run,

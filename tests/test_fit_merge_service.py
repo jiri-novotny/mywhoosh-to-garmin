@@ -212,3 +212,111 @@ def test_fallback_duplicate_check_compares_in_utc():
     ride_start = ActivityProcessor(MagicMock(), MagicMock(), svc)._parse_activity_date(1793678915)
     assert ride_start.tzinfo is not None
     assert svc.check_duplicate_activity(ride_start, 'MyWhoosh - Mount Grizzly', threshold_hours=0.1)
+
+
+def test_offline_merge_files_dry_run(tmp_path):
+    """--merge --file: no MyWhoosh login, local files merged into the overlapping watch recording."""
+    import os
+    import shutil
+    watch, m1, m2 = tmp_path / "watch.fit", tmp_path / "m1.fit", tmp_path / "m2.fit"
+    _make_watch(watch, duration=200)
+    _make_mywhoosh(m1, start_offset=5, duration=80, clock_skew=-1)
+    _make_mywhoosh(m2, start_offset=100, duration=90, clock_skew=-1)
+
+    start = datetime.fromtimestamp(T0, tz=timezone.utc)
+    garmin = _garmin_with([{'activityId': 42, 'activityName': 'Indoor Cycling',
+                            'startTimeGMT': start.strftime('%Y-%m-%d %H:%M:%S'),
+                            'elapsedDuration': 200, 'activityType': {'typeKey': 'indoor_cycling'}}])
+    def fake_download(activity_id, dest):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        return shutil.copy(watch, dest)
+    garmin.download_original_fit = fake_download
+    mywhoosh = MagicMock()
+    processor = ActivityProcessor(mywhoosh, MagicMock(), garmin)
+
+    stats = processor.process_merge_files([str(m2), str(m1)], dry_run=True,
+                                          output_dir=str(tmp_path / "out"),
+                                          backup_dir=str(tmp_path / "bak"))
+
+    assert stats == {'total': 2, 'merged': 2, 'uploaded': 0, 'skipped': 0, 'errors': 0}
+    mywhoosh.authenticate.assert_not_called()
+    mywhoosh.download_activity.assert_not_called()
+    merged = read_fit(str(tmp_path / "out" / "merged_42.fit")).messages(RECORD)
+    gps = [i for i, r in enumerate(merged) if r.get(0) is not None]
+    assert gps[0] == 5 and gps[-1] == 189   # both rides placed in the one recording
+    assert m1.exists() and m2.exists()     # user's files are not deleted
+
+
+# --- naming -----------------------------------------------------------------
+
+from services.route_names import RouteNameCache  # noqa: E402
+
+
+def test_route_name_cache_persists(tmp_path):
+    path = str(tmp_path / "routes.json")
+    RouteNameCache(path).set(90, "San Francisco Spin")
+    assert RouteNameCache(path).get(90) == "San Francisco Spin"
+    assert RouteNameCache(path).get(91) is None
+
+
+def test_name_from_garmin_location():
+    assert ActivityProcessor._name_from_garmin({'activityName': 'Mompós Virtual Cycling'}) == \
+        'MyWhoosh - Mompós'
+    assert ActivityProcessor._name_from_garmin({'activityName': ''}) is None
+
+
+def _offline_processor(tmp_path, route_names):
+    import os
+    import shutil
+    watch, ride = tmp_path / "watch.fit", tmp_path / "a.fit"
+    _make_watch(watch, duration=200)
+    _make_mywhoosh(ride, start_offset=5, duration=150, clock_skew=0)
+    start = datetime.fromtimestamp(T0, tz=timezone.utc)
+    garmin = _garmin_with([{'activityId': 42, 'activityName': 'Indoor Cycling',
+                            'startTimeGMT': start.strftime('%Y-%m-%d %H:%M:%S'),
+                            'elapsedDuration': 200, 'activityType': {'typeKey': 'indoor_cycling'}}])
+
+    def fake_download(activity_id, dest):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        return shutil.copy(watch, dest)
+    garmin.download_original_fit = fake_download
+    garmin.replace_activity = MagicMock(return_value=43)
+    processor = ActivityProcessor(MagicMock(), MagicMock(), garmin, route_names=route_names)
+    processor.fit_merge_service.route_id = lambda path: 90
+    return processor, str(ride), garmin
+
+
+def _uploaded_name(garmin):
+    return garmin.replace_activity.call_args.args[3]
+
+
+def test_offline_name_from_route_cache(tmp_path):
+    cache = RouteNameCache(str(tmp_path / "routes.json"))
+    cache.set(90, "San Francisco Spin")
+    processor, ride, garmin = _offline_processor(tmp_path, cache)
+    processor.process_merge_files([ride], backup_dir=str(tmp_path / "bak"))
+    assert _uploaded_name(garmin) == "MyWhoosh - San Francisco Spin"
+
+
+def test_offline_name_option_gets_prefix(tmp_path):
+    processor, ride, garmin = _offline_processor(tmp_path, RouteNameCache(str(tmp_path / "r.json")))
+    processor.process_merge_files([ride], name="Evening Spin", backup_dir=str(tmp_path / "bak"))
+    assert _uploaded_name(garmin) == "MyWhoosh - Evening Spin"
+    assert processor.route_names.get(90) == "Evening Spin"  # remembered for this route
+
+
+def test_offline_unknown_route_falls_back_to_garmin_place(tmp_path):
+    processor, ride, garmin = _offline_processor(tmp_path, RouteNameCache(str(tmp_path / "r.json")))
+    processor.process_merge_files([ride], backup_dir=str(tmp_path / "bak"))
+    name = _uploaded_name(garmin)
+    assert callable(name)
+    assert name({'activityName': 'El Dorado County Virtual Cycling'}) == "MyWhoosh - El Dorado County"
+
+
+def test_online_download_records_route_name(tmp_path):
+    cache = RouteNameCache(str(tmp_path / "routes.json"))
+    processor = ActivityProcessor(MagicMock(), MagicMock(), MagicMock(), route_names=cache)
+    processor.mywhoosh_service.download_activity.return_value = "/tmp/x.fit"
+    processor.fit_merge_service.route_id = lambda path: 85
+    processor._ride_file({'path': None, 'activity': {}, 'title': 'MyWhoosh - Mount Grizzly'})
+    assert cache.get(85) == "Mount Grizzly"

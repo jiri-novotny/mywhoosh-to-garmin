@@ -199,6 +199,27 @@ How it works:
 3. Rides already on Garmin as "Virtual Cycling" (merged or uploaded earlier) are skipped.
    Rides with no watch recording are uploaded the normal way.
 
+**Offline mode (`--file`):** download the ride's FIT file from the MyWhoosh website or app
+yourself and merge it without logging in to MyWhoosh (MyWhoosh allows only one session per
+account, so the API login fails while you are logged in on another device):
+
+```bash
+python main.py --merge --file ~/Downloads/ride.fit
+# Several rides inside one watch recording, with a custom name:
+python main.py --merge --file a.fit --file b.fit --name "MyWhoosh - Route A + Route B"
+```
+
+Activities are named like online ones, `MyWhoosh - <ride name>`:
+- `--name` sets the name (the `MyWhoosh - ` prefix is added if missing); with a single
+  `--file` it is also remembered for that route, so you only have to give it once;
+- otherwise the ride name is looked up by the route id stored in the FIT file. MyWhoosh's
+  own title field in the file is corrupted, so names are learned from online runs and
+  cached in `~/.cache/mywhoosh-to-garmin/routes.json` (any route ridden online before);
+- for unknown routes, Garmin's location name is used ("Mompós Virtual Cycling" →
+  `MyWhoosh - Mompós`).
+
+Only Garmin credentials are required in this mode.
+
 Note: deleting the watch activity also removes anything you added to it in Garmin Connect
 (notes, gear, photos). To restore an original, upload its file from `./backups`.
 

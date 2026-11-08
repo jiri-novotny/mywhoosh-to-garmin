@@ -68,6 +68,10 @@ class MyWhooshService:
 
             else:
                 message = data.get("Message", "Unknown error")
+                if "another device" in message.lower():
+                    # MyWhoosh allows a single session per account.
+                    message += (" Log out of the MyWhoosh app on your other devices (or close it) "
+                                "and try again, or download the ride's FIT file and use --merge --file PATH.")
                 self.logger.error(f"Authentication failed: {message}")
                 raise RuntimeError(f"Authentication failed: {message}")
 
